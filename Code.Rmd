@@ -1,0 +1,226 @@
+---
+title: "Bayesian Final Takehome"
+author: "Kerui Cao"
+date: "12/15/2019"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+pacman::p_load(tidyverse,truncnorm,bayesplot,rstan,gee)
+```
+
+```{r summplementary function}
+rho.bui = function(rho,n){tem = matrix(nrow = n,ncol = n,data = rho);diag(tem) = 1;return(tem)}
+ratio = function(rho0,sigma,beta,x,y,ran.wal.sd){
+  rho1 = rtruncnorm(n = 1,a = -1,b = 1,mean = rho0,sd = ran.wal.sd)
+  n = length(y)
+  rrho0 = rho.bui(rho = rho0,n = n)
+  rrho1 = rho.bui(rho = rho1,n = n)
+  xb = x %*% beta
+  yxb = y - xb
+  part1 =(-1/(2*sigma)*t(yxb)%*% (solve(rrho1)-solve(rrho0))%*%yxb)
+  part2 = log((n-1)/(1-rho1^2) + 1/(rho1^2))-log((n-1)/(1-rho0^2) + 1/(rho0^2))
+  ratio = exp(part1+part2)
+  return(list(ratio = ratio,rho1 = rho1))
+}
+
+rinvchisq <- function (ns, nu, nu_tau2) 1 / rgamma(ns, nu / 2, nu_tau2 / 2)
+
+mcmc_array <- function (ns, nchains = 1, params) {
+  nparams <- length(params)
+  array(dim = c(ns, nchains, nparams),
+        dimnames = list(iterations = NULL,
+                        chains = paste0("chain", 1:nchains),
+                        parameters = params))
+}
+
+post.single = function(x,y,rho,sigma2,beta,n = NULL){
+  if(is.null(n))n = length(y)
+  xb = x%*%beta
+  yxb = y - xb
+  part1 = -0.5*log((1-rho)^(n-1)*(1+(n-1)*rho))
+  tem = 1/(1-rho)*(diag(n) - matrix(nrow = n,ncol = n,data = (rho/(1+(n-1)*rho))))
+  part2 = -1/(2*sigma2)*t(yxb)%*%tem%*%yxb
+  part3 = 0.5*log((n-1)/(1-rho^2)+1/(rho^2))
+  post.like = exp(part1+part2+part3)
+  post.like
+}
+
+post = function(x,y,sigma2,beta){
+  n = length(y)
+  rho = seq(from = -1/(n-1)+0.0001,to = 0.979692210058702,length.out = 100)
+  poss = matrix(nrow = 100,ncol = 1)
+  for(i in 1:length(rho)){
+    poss[i] = post.single(x = x,y = y,rho = rho[i],sigma2 = sigma2,beta = beta,n = n)
+  }
+  poss = poss/sum(poss)
+  re = na.omit(cbind(rho,poss))
+  return(sample(x = re[,1],size = 1,replace = F,prob = re[,2]))
+}
+```
+
+```{r}
+bslm_sample <- function (y, x, prior_coef = NULL, prior_disp = NULL,
+                         chains = 4, iter = 2000, warmup = floor(iter / 2),ran.wal.sd) {
+  
+  nvars <- ncol(x); nobs <- nrow(x)
+  dn <- colnames(x); if (is.null(dn)) dn <- paste0("x", 1L:nvars)
+  if (is.null(prior_coef))
+    prior_coef <- list(mean = rep(0, nvars), precision = rep(0, nvars))
+  if (is.null(prior_disp))
+    prior_disp <- list(df = 0, scale = 0)
+  S_inv0 <- prior_coef$precision
+  beta0 <- prior_coef$mean
+  beta0 <- if (is.vector(S_inv0)) S_inv0 * beta0 else S_inv0 %*% beta0
+  nu <- prior_disp$df
+  nu_tau2 <- nu * prior_disp$scale
+  
+  rho0 = 0.1
+  rrho0 = rho.bui(rho = rho0,n = nobs)
+  
+  
+  c = chol(rrho0)
+  cp = solve(t(c))
+  y.t = cp %*% y
+  x.t = cp %*% x
+  
+  rss <- sum((y.t - mean(y.t)) ^ 2)
+  sigma2 <- (nu_tau2 + rss) / (nu + nobs)
+  sims <- mcmc_array(iter - warmup, chains, c(dn, "sigma", "lp__", "Rho"))
+  repy = matrix(nrow = nobs,ncol = iter - warmup)
+  
+  for (chain in 1:chains) {
+    for (it in 1:iter) {
+      z <- crossprod(x.t, y.t) / sigma2 + beta0
+      V_inv <- crossprod(x.t) / sigma2
+      if (is.vector(S_inv0)) # diagonal precision?
+        diag(V_inv) <- diag(V_inv) + S_inv0
+      else
+        V_inv <- V_inv + S_inv0
+      c =  C <- chol(V_inv)
+      u <- backsolve(C, z, transpose = TRUE)
+      coef <- drop(backsolve(C, u + rnorm(nvars)))
+      rss <- sum((y.t - drop(x.t %*% coef)) ^ 2)
+      sigma2 <- rinvchisq(1, nu + nobs, nu_tau2 + rss)
+      
+      ratio = ratio(rho0 = rho0,sigma = sigma2,beta = coef,x = x,y = y,ran.wal.sd = ran.wal.sd)
+      a = runif(1)
+      if(ratio$ratio >a){
+        rho0 = ratio$rho1
+      }
+      rrho0 = rho.bui(rho = rho0,n = nobs)
+      c = chol(rrho0)
+      cp = solve(t(c))
+      y.t = cp %*% y
+      x.t = cp %*% x
+      
+      
+      lp <- -((nu + nobs) / 2 + 1) * log(sigma2) - .5 * (nu_tau2 + rss) / sigma2
+      if (it > warmup)
+        sims[it - warmup, chain, ] <- c(coef, sqrt(sigma2), lp, rho0)
+        repy[,it - warmup] = x %*% coef
+    }
+  }
+  return(list(sims = sims,repy = repy))
+}
+
+     
+```
+
+```{r}
+stroke = read.csv("stroke.csv")
+x = model.matrix(data = stroke,score~week)
+y = stroke$score
+sims = bslm_sample(y = y,x = x,ran.wal.sd = 0.0001)
+```
+```{r}
+par(mfrow=c(2,2))
+monitor(sims)
+mcmc_trace(sims)
+mcmc_acf(sims)
+mcmc_hist(sims)
+mcmc_intervals(sims)
+```
+
+```{r}
+mo1 = gee(data = stroke,score~week,id = subject,corstr = "exchangeable")
+summary(mo1)
+```
+
+```{r}
+mo2 = rstanarm::stan_glmer(data = stroke,formula = score~week + (1|subject))
+rstanarm::pp_check(mo1)
+```
+
+```{r}
+  a = sims[,1,]
+  a = a[,1:2] %>% data.frame()
+  a = a %>% mutate(id = 1:1000)
+  a = a %>% mutate(id = cut(id,breaks = 20,labels = F))
+  colnames(a) = c("a","b","id")
+  a = a %>% group_by(id) %>% summarise(a = mean(a),b = mean(b)) %>% select(-id)
+  a = t(a)
+  y = x%*% a
+  y = data.frame(y)
+  y = y %>% mutate(obs = stroke$score)
+  y = y %>% pivot_longer(cols = 1:21,names_to = "type",values_to = "value")
+  y = y %>% mutate(observe = ifelse(y$type == "obs","Observe","Replicated"))
+  ggplot(y) + geom_density(aes(x = value,color = observe,group = type))
+```
+
+```{r}
+y = stroke$score
+uhat <- (y - as.numeric(drop(x %*% as.matrix(a[,1])))) / 22.7
+ns <- dim(sims)[1]
+u <- matrix(nrow = ns, ncol = n)
+yhat <- matrix(nrow = ns, ncol = n)
+for (s in 1:ns) {
+  yhat[s,] <- drop(x %*% sims[s, 1, 1:2]) # fitted values
+  u[s,] <- (y - yhat[s,]) / sims[s, 1, 2 + 1] # standardized residuals
+}
+
+outlier_threshold <- function (ntests = 1, alpha = .05)-qnorm(.5 * (1 - (1 - alpha) ^ (1 / ntests)))
+#k <- outlier_threshold(1) # very liberal
+k <- outlier_threshold(n)
+
+boxplot(u, outline = FALSE)
+abline(h = 0, lty = 3); abline(h = c(-k, k), lty = 2, col = "red")
+```
+
+```{r}
+stroke = read.csv("stroke.csv")
+y = stroke$score
+x = model.matrix(data = stroke,~week+group+week:group)
+p <- ncol(x); n <- length(y)
+nu <- tau2 <- 0
+beta0 <- rep(0, p); Sigma0 <- chol2inv(chol(crossprod(x)))
+x0 <- model.matrix(~week+group, data = stroke)
+p0 <- ncol(x0); ind0 <- 1:p0
+Sigma0_null <- chol2inv(chol(crossprod(x0)))
+
+m <- 100
+g <- seq(0, n, length=m + 1)[-1]
+BF <- numeric(m)
+
+log_marg_y <- function (y, x, beta0, Sigma0, nu, nu_tau2) {
+  n <- length(y)
+  C <- chol(diag(n) + x %*% tcrossprod(Sigma0, x))
+  v <- crossprod(backsolve(C, y - x %*% as.matrix(beta0), transpose = TRUE))
+  -sum(log(diag(C))) - (nu + n) / 2 * log(nu_tau2 + v)
+}
+
+for (i in 1:m) {
+  l1 <- log_marg_y(y, x, beta0, g[i] * Sigma0, nu, nu * tau2) # log(P(y|z_1))
+  l0 <- log_marg_y(y, x[, ind0], beta0[ind0], g[i] * Sigma0_null,
+                   nu, nu * tau2) # log(P(y|z_0))
+  BF[i] <- exp(l1 - l0)
+}
+
+plot(g, BF, type = "l")
+
+gamma <- 1; alpha <- .5
+pH0 <- 1 - alpha
+abline(h = gamma * pH0 / (1 - pH0), col = "red")
+abline(v = g[which.max(BF)], lty = 2)
+```
